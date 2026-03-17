@@ -20,6 +20,23 @@
                                  // since ICM chip fails to write config FSS for now
 #define MAX_DUTY_CYCLE_CMD_percent (100)
 
+#define DO_CALIBRATION (true)
+#define GYRO_SETTLING_PERIOD_ms (500)
+#define GYRO_SETTLING_PERIOD_cycles (GYRO_DATA_PROC_FREQ_hz * GYRO_SETTLING_PERIOD_ms / 1000)
+#define GYRO_CALIBRATION_PERIOD_ms (1000)
+#define GYRO_CALIBRATION_PERIOD_cycles (GYRO_DATA_PROC_FREQ_hz * GYRO_CALIBRATION_PERIOD_ms / 1000)
+#define FORCE_BIAS_raw (-100.0)
+
+typedef enum {
+    GYRO_CAL_STATE_SETTLING = 0,
+    GYRO_CAL_STATE_CALIBRATING,
+    GYRO_CAL_STATE_READY
+} gyroCalbrationState_t;
+
+static float rawBias = FORCE_BIAS_raw; // overritten if DO_CALIBRATION is true
+
+static float angPosDeadReck_deg = 0.0;
+
 /* i2c bus configuration */
 i2c_config_t conf = {
 	.mode = I2C_MODE_MASTER,
@@ -88,11 +105,18 @@ void print_agmt(icm20948_agmt_t agmt)
 
  // Outputs filtered (sliding window average) gyroX data. 
  // Change window size (milliseconds) using GYR_WINDOW_ms definition
- float processGyro(icm20948_agmt_t *agmt) {
+ float processGyro(icm20948_agmt_t *agmt, gyroCalbrationState_t calState) {
     static int16_t gyroXBuffer[GYRO_DATA_BUFFER_LEN];
     static int gbi = 0; // buffer index
     static bool full = false; 
     static float avg = 0.0;
+    static int calDataCount = 0;
+
+    if(calState == GYRO_CAL_STATE_CALIBRATING) {
+        // just a huge average over the calibration period
+        rawBias =  ((rawBias * calDataCount) / (calDataCount + 1)) + (agmt->gyr.axes.x / (calDataCount + 1));
+        calDataCount++;
+    }
 
     if(full) {
         // expel old data point from average
@@ -109,6 +133,12 @@ void print_agmt(icm20948_agmt_t agmt)
 
     // include new data point in average
     avg += ((float)agmt->gyr.axes.x / (full ? GYRO_DATA_BUFFER_LEN : gbi)); // after update, newsize = gbi
+
+    if(calState == GYRO_CAL_STATE_READY) {
+        avg -= rawBias;
+
+        // angular position integration can now begin
+    }
 
     return avg;
 }
@@ -194,11 +224,13 @@ void imu_task(void *arg)
 	icm20948_sleep(&icm, false);
 	icm20948_low_power(&icm, false);
 
+
     // argument to this task is the queue for CORE0 (this) --> CORE1 communication
     QueueHandle_t queue = (QueueHandle_t)arg;
     icm20948_agmt_t agmt;
     float gxFiltered = 0;
     int motorCmd = 0;
+    gyroCalbrationState_t gyroCalState = (DO_CALIBRATION) ? GYRO_CAL_STATE_SETTLING : GYRO_CAL_STATE_READY;
     int iter = 0;
 
     while (1) {
@@ -207,9 +239,19 @@ void imu_task(void *arg)
         // Read and process Gyro data at frequency GYRO_DATA_PROC_FREQ_hz
         if (ICM_20948_STAT_OK == icm20948_get_agmt(&icm, &agmt)) {
             // process gyro data
-            gxFiltered = processGyro(&agmt);
+            gxFiltered = processGyro(&agmt, gyroCalState);
         } else {
             ESP_LOGE(TAG, "Unable to read from ICM20948");
+        }
+
+        // BIAS CALIBRATION (sensor must be still)
+        // in order to integrate Gyro angular speed to get angular position, 
+        // we need to eliminate bias in angular speed measurement. 
+        if((gyroCalState == GYRO_CAL_STATE_SETTLING) && (iter == GYRO_SETTLING_PERIOD_cycles)) {
+            gyroCalState = GYRO_CAL_STATE_CALIBRATING;
+        }
+        if((gyroCalState == GYRO_CAL_STATE_CALIBRATING) && (iter == GYRO_CALIBRATION_PERIOD_cycles)) {
+            gyroCalState = GYRO_CAL_STATE_READY;
         }
 
         // Send motor commands at frequency MOTOR_CMD_FREQ_hz
@@ -217,7 +259,10 @@ void imu_task(void *arg)
             motorCmd = gyroToMotorCommand(gxFiltered);
             //motorCmd = testMotorCommand(iter);
 
-            //ESP_LOGI(TAG, "sending motor cmd = %d", motorCmd);
+            if(gyroCalState != GYRO_CAL_STATE_READY) {
+                motorCmd = 0;
+            }
+
             if (xQueueGenericSend(queue, (void *)&motorCmd, portMAX_DELAY, queueSEND_TO_BACK) != pdTRUE) {
                 ESP_LOGI(TAG, "Queue full\n");
             }
